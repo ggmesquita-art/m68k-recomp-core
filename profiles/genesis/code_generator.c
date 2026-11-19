@@ -1249,8 +1249,10 @@ static void report_misaligned_entries_in_range(uint32_t pc, uint32_t len,
  *
  * Heuristic for "this is a Duff's device" (vs. e.g. a bra.w jump table):
  *  - Stop on the first probe address NOT in `instrs` (out of function).
- *  - Stop on the first opcode that doesn't match the base instruction's
- *    opcode + byte_length. (Bra.w tables have 4-byte entries with
+ *  - Stop on the first instruction that doesn't match the base instruction's
+ *    mnemonic + byte_length. Matching the mnemonic (not the full opcode word)
+ *    also covers register-varying tails such as Eternal Champions' palette
+ *    shuffle at $05E246 (`exg d1,d6; exg d2,d4; exg d3,d5; ...`). (Bra.w tables have 4-byte entries with
  *    non-instruction displacement words between them, so the first probe
  *    at base+2 fails the `addrset_contains` check and we exit with n=1,
  *    correctly signalling "not a Duff's device — caller should fall back
@@ -1287,7 +1289,7 @@ static int probe_pc_idx_targets(const GenesisRom *rom,
 
     M68KInstr first;
     if (!m68k_decode(rom, base, &first)) return 0;
-    uint16_t first_op  = first.words[0];
+    int      first_mn  = (int)first.mnemonic;
     int      first_len = first.byte_length;
     if (first_len < 2) return 0;
 
@@ -1303,7 +1305,7 @@ static int probe_pc_idx_targets(const GenesisRom *rom,
         if (!addrset_contains(instrs, t)) break;
         M68KInstr probe;
         if (!m68k_decode(rom, t, &probe)) break;
-        if (probe.words[0] != first_op)  break;
+        if ((int)probe.mnemonic != first_mn) break;
         if (probe.byte_length != first_len) break;
         out_targets[n++] = t;
     }
@@ -1410,13 +1412,18 @@ static void seed_pc_idx_dispatch_targets(const GenesisRom *rom,
      * Sonic 1's Deform_SLZ JMP at $00647C dispatches into the body of
      * the loc_6480 function — boundary-split will promote each landing
      * point separately, but we need to seed them all first). */
-    uint16_t op0 = ((uint16_t)rom->rom_data[base] << 8) | rom->rom_data[base + 1];
+    /* Uniformity = same mnemonic and 2-byte length (matches
+     * probe_pc_idx_targets), so register-varying tails such as
+     * `exg d1,d6; exg d2,d4; ...` (Eternal Champions $05E246) qualify. */
+    M68KInstr d0i;
+    if (!m68k_decode(rom, base, &d0i) || d0i.byte_length != 2) return;
     int n_same = 1;
     for (int i = 1; i < 32; i++) {
         uint32_t a = base + (uint32_t)i * 2u;
         if (a + 1 >= rom->rom_size) break;
-        uint16_t w = ((uint16_t)rom->rom_data[a] << 8) | rom->rom_data[a + 1];
-        if (w != op0) break;
+        M68KInstr di;
+        if (!m68k_decode(rom, a, &di)) break;
+        if (di.mnemonic != d0i.mnemonic || di.byte_length != 2) break;
         n_same++;
     }
     if (n_same >= 8) {
@@ -2039,6 +2046,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                     || m68k_return_capture_has_capturing_exit(rom, func_addr))) {
             fprintf(f, "  if (_sp_popped >= 4) { g_rte_pending = _sp_popped / 4; _sp_popped = 0; }\n");
             fprintf(f, "  else if (g_split_sp_popped >= 4) { g_rte_pending = g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
+        } else if (*has_sp_adjust) {
+            fprintf(f, "  if (_entry_split_sp_popped >= 4) { g_rte_pending = _entry_split_sp_popped / 4; _entry_split_sp_popped = 0; }\n");
+            fprintf(f, "  else if (g_split_sp_popped >= 4) { g_rte_pending = g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
         } else {
             fprintf(f, "  if (g_split_sp_popped >= 4) { g_rte_pending = g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
         }
@@ -2221,6 +2231,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             function_finder_pops_return_unconditionally(rom, instr->target_addr)) {
             fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push (callee captures return) */\n",
                     ret_addr);
+            /* The 68000 retires JSR/BSR (push + PC load) before the callee's
+             * first instruction, and m68k_interp charges it there too: charge
+             * the call's cycles BEFORE the callee, not after it returns. */
+            emit_cycle_accounting(f, "  ", estimate_cycles(instr));
             fprintf(f, "  { int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n");
             if (func_is_native_rom(rom,instr->target_addr))
                 fprintf(f, "    RECOMP_CALL_NATIVE(func_%06X);\n", instr->target_addr);
@@ -2228,8 +2242,13 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 fprintf(f, "    recomp_call_addr(0x%06Xu);\n", instr->target_addr);
             fprintf(f, "    g_split_sp_popped = _saved_split_sp_popped;\n");
             fprintf(f, "  }\n");
-            fprintf(f, "  g_rte_pending = 0; /* callee captured our return; handled here */\n");
-            emit_cycle_accounting(f, "  ", estimate_cycles(instr));
+            fprintf(f, "  if (g_rte_pending) --g_rte_pending; /* callee captured our return; handled here */\n");
+            if (*has_sp_adjust) {
+                fprintf(f, "  if (_entry_split_sp_popped >= 4) { g_rte_pending += _entry_split_sp_popped / 4; _entry_split_sp_popped = 0; }\n");
+                fprintf(f, "  else if (g_split_sp_popped >= 4) { g_rte_pending += g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
+            } else {
+                fprintf(f, "  if (g_split_sp_popped >= 4) { g_rte_pending += g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
+            }
             fprintf(f, "  return; /* callee captured return addr: no pop, no fall-through */\n");
             *skip_until_label = true;
             break;
@@ -2241,6 +2260,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f, "  uint32_t _jsr_pre_sp_%06X = g_cpu.A[7];\n", addr);
         fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push */\n", ret_addr);
         fprintf(f, "  uint32_t _jsr_slot_sp_%06X = g_cpu.A[7];\n", addr);
+        /* Charge the call before the callee runs (68000 order; mirrors
+         * m68k_interp). The generic post-instruction accounting skips
+         * JSR/BSR, and the skip-propagation return below no longer charges. */
+        emit_cycle_accounting(f, "  ", estimate_cycles(instr));
 
         if (instr->has_target) {
             fprintf(f, "  { int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n");
@@ -2315,7 +2338,12 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * pop keeps A7 in sync with hardware. Consume one skipped return
          * slot; additional skipped slots continue through outer callers. */
         fprintf(f, "  if (g_rte_pending) { --g_rte_pending;\n");
-        emit_cycle_accounting(f, "    ", estimate_cycles(instr));
+        if (*has_sp_adjust) {
+            fprintf(f, "    if (_entry_split_sp_popped >= 4) { g_rte_pending += _entry_split_sp_popped / 4; _entry_split_sp_popped = 0; }\n");
+            fprintf(f, "    else if (g_split_sp_popped >= 4) { g_rte_pending += g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
+        } else {
+            fprintf(f, "    if (g_split_sp_popped >= 4) { g_rte_pending += g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
+        }
         fprintf(f, "    return; } /* RTE/skip propagation (pre-pop) */\n");
         fprintf(f,
                 "  if (g_cpu.A[7] != (uint32_t)(_jsr_slot_sp_%06X + 4u))\n"
@@ -5245,6 +5273,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
              * path, not a real JSR boundary.  Consume its carried net stack
              * delta into this function's path-local accounting before any
              * MOVEM/ADDQ adjustment changes it. */
+            fprintf(f_func, "  int _entry_split_sp_popped = g_split_sp_popped; (void)_entry_split_sp_popped;\n");
             fprintf(f_func, "  int _sp_popped = g_split_sp_popped;\n");
             fprintf(f_func, "  g_split_sp_popped = 0;\n");
         }
@@ -5428,7 +5457,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
              * 68K cycles from frame start = scanline 224).  This allows
              * the VBlank handler to fire between any two instructions,
              * matching the interpreter's interrupt-driven behavior. */
-            {
+            if (instr.mnemonic != MN_JSR && instr.mnemonic != MN_BSR) {
                 int cyc = estimate_cycles(&instr);
                 emit_cycle_accounting(f_func, "  ", cyc);
             }
