@@ -2052,6 +2052,16 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         } else {
             fprintf(f, "  if (g_split_sp_popped >= 4) { g_rte_pending = g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
         }
+        /* Hardware-faithful RTS: pop the return address from the guest stack.
+         * The old convention left the pop to the caller's JSR wrapper, which
+         * cannot distinguish "callee consumed my slot" from "callee restored
+         * SP to slot+4 without consuming it" (the game's hand-rolled
+         * link/unlk ring-buffer pattern, e.g. Eternal Champions' Z80 ring at
+         * $07E4/$0810, leaks 4 bytes per iteration otherwise — observed as a
+         * growing A7 divergence that clobbers the frame loop's saved
+         * registers). Popping here makes SP faithful on every path; the
+         * wrapper below only compensates when the slot is still intact. */
+        fprintf(f, "  g_cpu.PC = m68k_read32(g_cpu.A[7]); g_cpu.A[7] += 4; /* RTS: pop return */\n");
         emit_cycle_accounting(f, "  ", estimate_cycles(instr));
         fprintf(f, "  return;\n");
         *skip_until_label = true;
@@ -2331,13 +2341,15 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f, "  }\n");
 
         /* Pop return address from 68K stack.
-         * Check g_rte_pending BEFORE the pop: when the callee used the
-         * `addq.l #4,sp; rts` skip idiom, the game's own addq already
-         * adjusted A7 and SJ's rts popped the slot this wrapper pushed.
-         * Doing our pop here would double-adjust A7 by +4. Skipping the
-         * pop keeps A7 in sync with hardware. Consume one skipped return
-         * slot; additional skipped slots continue through outer callers. */
-        fprintf(f, "  if (g_rte_pending) { --g_rte_pending;\n");
+         * The callee's generated RTS already pops its return slot (hardware-
+         * faithful). Compensate only when the slot is STILL INTACT (SP ==
+         * slot): a callee that returned via a path that never executed its
+         * RTS (e.g. an unwound RTE propagation) leaves the slot in place.
+         * Every other SP value means the guest's own stack arithmetic owns
+         * the frame (skip-return idioms, link/unlk ring patterns) — touching
+         * it here would double-adjust. */
+        fprintf(f,
+                "  if (g_rte_pending) { --g_rte_pending;\n");
         if (*has_sp_adjust) {
             fprintf(f, "    if (_entry_split_sp_popped >= 4) { g_rte_pending += _entry_split_sp_popped / 4; _entry_split_sp_popped = 0; }\n");
             fprintf(f, "    else if (g_split_sp_popped >= 4) { g_rte_pending += g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
@@ -2346,10 +2358,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         }
         fprintf(f, "    return; } /* RTE/skip propagation (pre-pop) */\n");
         fprintf(f,
-                "  if (g_cpu.A[7] != (uint32_t)(_jsr_slot_sp_%06X + 4u))\n"
-                "    g_cpu.A[7] += 4; /* normal JSR pop */\n"
-                "  else\n"
-                "    ; /* nested skip-return already consumed this slot */\n",
+                "  if (g_cpu.A[7] == (uint32_t)_jsr_slot_sp_%06X)\n"
+                "    g_cpu.A[7] += 4; /* slot intact: callee never popped it */\n",
                 addr);
         break;
     }
